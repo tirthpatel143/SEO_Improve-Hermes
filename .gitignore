@@ -1,0 +1,16 @@
+.env
+.env.local
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+node_modules/
+dist/
+build/
+.agent/
+scratch/
+data/
+runtime/
+agent_workspace/
+credentials.json
