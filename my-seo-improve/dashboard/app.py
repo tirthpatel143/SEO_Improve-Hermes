@@ -687,6 +687,34 @@ with tab_github_fix:
             if clone_dir and os.path.exists(clone_dir):
                 issues = results["issues"]
 
+                # First, set the remote URL with auth token for the cloned repo
+                authed_repo_url = st.session_state.gh_scanned_repo.replace(
+                    "https://", f"https://x-access-token:{github_token}@"
+                ).replace(
+                    "http://", f"http://x-access-token:{github_token}@"
+                )
+                subprocess.run(
+                    ["git", "-C", clone_dir, "remote", "set-url", "origin", authed_repo_url],
+                    capture_output=True
+                )
+
+                # Detect default branch (main or master)
+                default_branch = "main"
+                branch_check = subprocess.run(
+                    ["git", "-C", clone_dir, "branch", "-r"],
+                    capture_output=True, text=True
+                )
+                if branch_check.returncode == 0:
+                    remote_branches = branch_check.stdout.strip().split("\n")
+                    if any("origin/master" in b for b in remote_branches):
+                        default_branch = "master"
+                    elif any("origin/main" in b for b in remote_branches):
+                        default_branch = "main"
+
+                # Fetch latest
+                subprocess.run(["git", "-C", clone_dir, "fetch", "origin", default_branch],
+                               capture_output=True)
+
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 fix_results = []
@@ -696,17 +724,34 @@ with tab_github_fix:
                     progress_bar.progress(progress)
                     status_text.info(f"Fixing {idx+1}/{len(issues)}: {issue['description'][:60]}...")
 
-                    branch_name = f"auto-fix/{issue['category'].lower().replace(' ', '-')}-{idx+1}"
+                    # Create unique branch name
+                    safe_cat = issue['category'].lower().replace(' ', '-').replace('/', '-')
+                    branch_name = f"auto-fix/{safe_cat}-{idx+1}"
 
-                    # Create branch
-                    subprocess.run(["git", "-C", clone_dir, "checkout", "-"],
+                    # Step 1: Go back to default branch fresh
+                    subprocess.run(["git", "-C", clone_dir, "checkout", default_branch],
                                    capture_output=True)
+                    subprocess.run(["git", "-C", clone_dir, "pull", "origin", default_branch],
+                                   capture_output=True)
+
+                    # Delete old local branch if exists
                     subprocess.run(["git", "-C", clone_dir, "branch", "-D", branch_name],
                                    capture_output=True)
-                    subprocess.run(["git", "-C", clone_dir, "checkout", "-b", branch_name],
-                                   capture_output=True)
 
-                    # Apply fix
+                    # Create new branch from default
+                    checkout_res = subprocess.run(
+                        ["git", "-C", clone_dir, "checkout", "-b", branch_name],
+                        capture_output=True, text=True
+                    )
+                    if checkout_res.returncode != 0:
+                        fix_results.append({
+                            "issue": issue["description"],
+                            "status": "branch_failed",
+                            "error": checkout_res.stderr
+                        })
+                        continue
+
+                    # Step 2: Apply the fix
                     target_file = os.path.join(clone_dir, issue["file"])
                     fixed = False
 
@@ -788,9 +833,11 @@ with tab_github_fix:
                             if fixed and new_content != content:
                                 with open(target_file, "w") as f:
                                     f.write(new_content)
+
                         except Exception as e:
-                            fix_results.append({"issue": issue["description"], "error": str(e)})
+                            fix_results.append({"issue": issue["description"], "status": "error", "error": str(e)})
                             continue
+
                     elif issue["category"] in ("Config", "Documentation"):
                         try:
                             if "Missing .gitignore" in issue["description"]:
@@ -803,66 +850,77 @@ with tab_github_fix:
                                     f.write(f"# {repo_n}\n\nProject description.\n")
                                 fixed = True
                         except Exception as e:
-                            fix_results.append({"issue": issue["description"], "error": str(e)})
+                            fix_results.append({"issue": issue["description"], "status": "error", "error": str(e)})
                             continue
 
                     if not fixed:
-                        fix_results.append({"issue": issue["description"], "status": "skipped"})
-                        subprocess.run(["git", "-C", clone_dir, "checkout", "-"], capture_output=True)
+                        fix_results.append({"issue": issue["description"], "status": "skipped", "reason": "Cannot auto-fix this issue type"})
                         continue
 
-                    # Commit & push
+                    # Step 3: Commit
                     subprocess.run(["git", "-C", clone_dir, "add", "-A"], capture_output=True)
-                    subprocess.run(["git", "-C", clone_dir, "commit", "-m",
-                                   f"Auto-fix: {issue['description'][:60]} ({issue['category']})"],
-                                   capture_output=True)
+                    commit_res = subprocess.run(
+                        ["git", "-C", clone_dir, "commit", "-m",
+                         f"Auto-fix: {issue['description'][:60]} ({issue['category']})"],
+                        capture_output=True, text=True
+                    )
+                    if commit_res.returncode != 0:
+                        # Maybe nothing to commit
+                        fix_results.append({"issue": issue["description"], "status": "nothing_to_commit", "error": commit_res.stderr})
+                        continue
 
-                    # Set auth and push
-                    auth_url = st.session_state.gh_scanned_repo.replace("https://", f"https://x-access-token:{github_token}@")
-                    subprocess.run(["git", "-C", clone_dir, "remote", "set-url", "origin", auth_url],
-                                   capture_output=True)
+                    # Step 4: Push branch to GitHub
                     push_res = subprocess.run(
                         ["git", "-C", clone_dir, "push", "-u", "origin", branch_name],
                         capture_output=True, text=True
                     )
 
+                    if push_res.returncode != 0:
+                        fix_results.append({
+                            "issue": issue["description"],
+                            "status": "push_failed",
+                            "branch": branch_name,
+                            "error": push_res.stderr
+                        })
+                        continue
+
+                    # Step 5: Create Pull Request via GitHub API
                     pr_link = None
-                    if push_res.returncode == 0:
-                        try:
-                            import requests
-                            match = _re.search(r'github\.com/([^/]+)/([^/.]+)', st.session_state.gh_scanned_repo)
-                            if match:
-                                owner, repo = match.groups()
-                                pr_data = {
-                                    "title": f"🔧 Fix: {issue['description'][:80]}",
-                                    "body": f"**Category:** {issue['category']}\n**Severity:** {issue['severity']}\n**File:** {issue['file']}\n\n{issue.get('fix', '')}\n\n*Auto-fixed by SEO Command Center*",
-                                    "head": branch_name,
-                                    "base": "main"
-                                }
-                                headers = {"Authorization": f"token {github_token}", "Accept": "application/vnd.github.v3+json"}
-                                resp = requests.post(f"https://api.github.com/repos/{owner}/{repo}/pulls", json=pr_data, headers=headers)
-                                if resp.status_code == 201:
-                                    pr_link = resp.json().get("html_url")
-                                else:
-                                    # Try master
-                                    pr_data["base"] = "master"
-                                    resp = requests.post(f"https://api.github.com/repos/{owner}/{repo}/pulls", json=pr_data, headers=headers)
-                                    if resp.status_code == 201:
-                                        pr_link = resp.json().get("html_url")
-                        except Exception:
-                            pass
+                    try:
+                        import requests
+                        match = _re.search(r'github\.com/([^/]+)/([^/.]+)', st.session_state.gh_scanned_repo)
+                        if match:
+                            owner, repo = match.groups()
+                            pr_data = {
+                                "title": f"🔧 Fix: {issue['description'][:80]}",
+                                "body": f"**Category:** {issue['category']}\n**Severity:** {issue['severity']}\n**File:** {issue['file']}:{issue.get('line', '')}\n\n{issue.get('fix', '')}\n\n*Auto-fixed by SEO Command Center*",
+                                "head": branch_name,
+                                "base": default_branch
+                            }
+                            headers = {
+                                "Authorization": f"token {github_token}",
+                                "Accept": "application/vnd.github.v3+json"
+                            }
+                            resp = requests.post(
+                                f"https://api.github.com/repos/{owner}/{repo}/pulls",
+                                json=pr_data, headers=headers, timeout=30
+                            )
+                            if resp.status_code == 201:
+                                pr_link = resp.json().get("html_url")
+                            else:
+                                pr_error = resp.json().get("message", f"HTTP {resp.status_code}")
+                    except Exception as e:
+                        pass
 
                     fix_results.append({
                         "issue": issue["description"],
                         "category": issue["category"],
                         "severity": issue["severity"],
                         "file": issue["file"],
-                        "status": "fixed" if push_res.returncode == 0 else "push_failed",
+                        "status": "fixed",
                         "branch": branch_name,
                         "pr_url": pr_link
                     })
-
-                    subprocess.run(["git", "-C", clone_dir, "checkout", "-"], capture_output=True)
 
                 progress_bar.empty()
                 status_text.empty()
@@ -870,7 +928,14 @@ with tab_github_fix:
 
                 fixed_count = sum(1 for r in fix_results if r.get("status") == "fixed")
                 pr_count = sum(1 for r in fix_results if r.get("pr_url"))
+                skipped_count = sum(1 for r in fix_results if r.get("status") == "skipped")
+                failed_count = sum(1 for r in fix_results if r.get("status") not in ("fixed", "skipped"))
+
                 st.success(f"✅ **Done!** Fixed {fixed_count}/{len(issues)} issues. Created {pr_count} Pull Requests.")
+                if failed_count > 0:
+                    st.warning(f"⚠️ {failed_count} issues failed. See details below.")
+                if skipped_count > 0:
+                    st.info(f"ℹ️ {skipped_count} issues skipped (cannot auto-fix).")
                 st.balloons()
 
         # ── Show Fix Results ──
