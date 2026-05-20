@@ -227,14 +227,14 @@ if not github_token or github_token in ["''", '""']:
     st.error("⚠️ **GitHub Authentication Required**: Please add your **Personal Access Token** in the **Settings** tab to enable automatic deployment to your repository.")
 
 # Tabs
-tab_overview, tab_tasks, tab_strategy, tab_product, tab_social, tab_swarm, tab_github_fix, tab_settings = st.tabs([
+tab_overview, tab_tasks, tab_strategy, tab_product, tab_social, tab_swarm, tab_github, tab_settings = st.tabs([
     "🏠 Executive Overview", 
     "🛠️ Technical Tasks", 
     "📈 Growth Strategy", 
     "💡 Product Intelligence", 
     "📢 Social Signals",
     "🐝 Swarm Monitor",
-    "🔧 GitHub Auto-Fix",
+    "🔗 Auto-Fix on GitHub",
     "⚙️ Settings"
 ])
 
@@ -576,7 +576,7 @@ with tab_swarm:
 # ═══════════════════════════════════════════════════════════════════════════
 # 🔧 GITHUB AUTO-FIX TAB
 # ═══════════════════════════════════════════════════════════════════════════
-with tab_github_fix:
+with tab_github:
     st.subheader("🔧 GitHub Repository Auto-Fixer")
     st.markdown("""
     **Paste any GitHub repo URL** → **Scan for all issues** → **Click "Fix All"** → **All issues fixed on GitHub with Pull Requests**
@@ -692,10 +692,11 @@ with tab_github_fix:
                 fix_results = []
 
                 # Step 1: Set auth URL once
+                _token = github_token
                 authed_repo_url = st.session_state.gh_scanned_repo.replace(
-                    "https://", f"https://x-access-token:{github_token}@"
+                    "https://", f"https://x-access-token:{_token}@"
                 ).replace(
-                    "http://", f"http://x-access-token:{github_token}@"
+                    "http://", f"http://x-access-token:{_token}@"
                 )
                 subprocess.run(
                     ["git", "-C", clone_dir, "remote", "set-url", "origin", authed_repo_url],
