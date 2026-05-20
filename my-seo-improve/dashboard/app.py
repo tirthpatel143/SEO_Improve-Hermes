@@ -227,13 +227,14 @@ if not github_token or github_token in ["''", '""']:
     st.error("⚠️ **GitHub Authentication Required**: Please add your **Personal Access Token** in the **Settings** tab to enable automatic deployment to your repository.")
 
 # Tabs
-tab_overview, tab_tasks, tab_strategy, tab_product, tab_social, tab_swarm, tab_settings = st.tabs([
+tab_overview, tab_tasks, tab_strategy, tab_product, tab_social, tab_swarm, tab_github_fix, tab_settings = st.tabs([
     "🏠 Executive Overview", 
     "🛠️ Technical Tasks", 
     "📈 Growth Strategy", 
     "💡 Product Intelligence", 
     "📢 Social Signals",
     "🐝 Swarm Monitor",
+    "🔧 GitHub Auto-Fix",
     "⚙️ Settings"
 ])
 
@@ -571,6 +572,357 @@ with tab_swarm:
                 """, unsafe_allow_html=True)
     else:
         st.error(f"Swarm configuration not found at {SWARM_CONFIG_PATH}")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 🔧 GITHUB AUTO-FIX TAB
+# ═══════════════════════════════════════════════════════════════════════════
+with tab_github_fix:
+    st.subheader("🔧 GitHub Repository Auto-Fixer")
+    st.markdown("""
+    **Paste any GitHub repo URL** → **Scan for all issues** → **Click "Fix All"** → **All issues fixed on GitHub with Pull Requests**
+    """)
+
+    # ── Setup ──
+    import re as _re
+    _base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    # ── Session state for scan results ──
+    if "gh_scan_results" not in st.session_state:
+        st.session_state.gh_scan_results = None
+    if "gh_fix_results" not in st.session_state:
+        st.session_state.gh_fix_results = None
+    if "gh_scanned_repo" not in st.session_state:
+        st.session_state.gh_scanned_repo = ""
+
+    # ── Input ──
+    col_input1, col_input2 = st.columns([3, 1])
+    with col_input1:
+        gh_repo_url = st.text_input(
+            "GitHub Repository URL",
+            value=os.environ.get("GITHUB_REPO", ""),
+            placeholder="https://github.com/username/repository",
+            key="gh_repo_input"
+        )
+    with col_input2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        scan_btn = st.button("🔍 Scan Repo", use_container_width=True, type="primary")
+
+    github_token = os.environ.get("GITHUB_TOKEN", "").strip()
+
+    if not github_token:
+        st.warning("⚠️ **GitHub Token Required**: Add your `GITHUB_TOKEN` in the **Settings** tab to enable push/PR creation. You can still scan without it.")
+
+    # ── Scan Action ──
+    if scan_btn and gh_repo_url:
+        st.session_state.gh_scanned_repo = gh_repo_url
+        st.session_state.gh_fix_results = None
+
+        with st.spinner(f"🔍 Scanning {gh_repo_url} for all issues..."):
+            # Clone repo to temp
+            import tempfile
+            tmp_dir = tempfile.mkdtemp(prefix="gh-scan-")
+            repo_name = gh_repo_url.rstrip("/").split("/")[-1].replace(".git", "")
+            clone_dir = os.path.join(tmp_dir, repo_name)
+
+            clone_res = subprocess.run(
+                ["git", "clone", "--depth", "1", gh_repo_url, clone_dir],
+                capture_output=True, text=True, timeout=120
+            )
+
+            if clone_res.returncode != 0:
+                st.error(f"❌ Failed to clone repo:\n```\n{clone_res.stderr}\n```")
+            else:
+                # Run scanner
+                scanner_script = os.path.join(_base_dir, "scripts", "github_scanner.py")
+                scan_res = subprocess.run(
+                    [sys.executable, scanner_script, "scan", clone_dir],
+                    capture_output=True, text=True, timeout=60
+                )
+
+                report_path = os.path.join(clone_dir, "scan_report.json")
+                if os.path.exists(report_path):
+                    with open(report_path, "r") as f:
+                        st.session_state.gh_scan_results = json.load(f)
+                    st.session_state.gh_clone_dir = clone_dir
+                    st.success(f"✅ Scan complete! Found **{st.session_state.gh_scan_results['total']}** issues.")
+                else:
+                    st.error(f"Scanner output:\n{scan_res.stdout}\n{scan_res.stderr}")
+
+    # ── Show Scan Results ──
+    if st.session_state.gh_scan_results:
+        results = st.session_state.gh_scan_results
+        total = results["total"]
+        by_sev = results["by_severity"]
+
+        st.markdown("---")
+        st.markdown("### 📊 Scan Results")
+
+        # Severity metrics
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Total Issues", total)
+        m2.metric("🔴 Critical", by_sev["critical"])
+        m3.metric("🟠 High", by_sev["high"])
+        m4.metric("🟡 Medium", by_sev["medium"])
+        m5.metric("🟢 Low", by_sev["low"])
+
+        # ── Fix All Button ──
+        st.markdown("---")
+        fix_col1, fix_col2 = st.columns([1, 3])
+        with fix_col1:
+            fix_all_btn = st.button(
+                "🚀 FIX ALL ON GITHUB",
+                use_container_width=True,
+                type="primary",
+                disabled=not github_token
+            )
+        with fix_col2:
+            if not github_token:
+                st.caption("⚠️ Add GITHUB_TOKEN in Settings to enable Fix All")
+            else:
+                st.caption(f"Will create up to {total} branches and PRs on {st.session_state.gh_scanned_repo}")
+
+        # ── Fix All Action ──
+        if fix_all_btn and github_token:
+            clone_dir = st.session_state.get("gh_clone_dir", "")
+            if clone_dir and os.path.exists(clone_dir):
+                issues = results["issues"]
+
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                fix_results = []
+
+                for idx, issue in enumerate(issues):
+                    progress = (idx + 1) / len(issues)
+                    progress_bar.progress(progress)
+                    status_text.info(f"Fixing {idx+1}/{len(issues)}: {issue['description'][:60]}...")
+
+                    branch_name = f"auto-fix/{issue['category'].lower().replace(' ', '-')}-{idx+1}"
+
+                    # Create branch
+                    subprocess.run(["git", "-C", clone_dir, "checkout", "-"],
+                                   capture_output=True)
+                    subprocess.run(["git", "-C", clone_dir, "branch", "-D", branch_name],
+                                   capture_output=True)
+                    subprocess.run(["git", "-C", clone_dir, "checkout", "-b", branch_name],
+                                   capture_output=True)
+
+                    # Apply fix
+                    target_file = os.path.join(clone_dir, issue["file"])
+                    fixed = False
+
+                    if os.path.exists(target_file):
+                        try:
+                            with open(target_file, "r") as f:
+                                content = f.read()
+                            new_content = content
+                            line_num = issue.get("line", 1)
+
+                            if "Bare 'except:'" in issue["description"]:
+                                new_content = content.replace("except:", "except Exception:")
+                                fixed = True
+                            elif "print() statement" in issue["description"]:
+                                lines = content.split('\n')
+                                if line_num <= len(lines):
+                                    lines[line_num - 1] = lines[line_num - 1].replace("print(", "# print(", 1)
+                                    new_content = '\n'.join(lines)
+                                    fixed = True
+                            elif "console.log" in issue["description"]:
+                                lines = content.split('\n')
+                                if line_num <= len(lines):
+                                    lines[line_num - 1] = lines[line_num - 1].replace("console.log", "// console.log", 1)
+                                    new_content = '\n'.join(lines)
+                                    fixed = True
+                            elif "Using 'var'" in issue["description"]:
+                                lines = content.split('\n')
+                                if line_num <= len(lines):
+                                    lines[line_num - 1] = lines[line_num - 1].replace("var ", "const ", 1)
+                                    new_content = '\n'.join(lines)
+                                    fixed = True
+                            elif issue["category"] == "SEO":
+                                if "Missing <title>" in issue["description"]:
+                                    new_content = content.replace("</head>", "  <title>Project Title</title>\n</head>")
+                                    fixed = True
+                                elif "Missing meta description" in issue["description"]:
+                                    new_content = content.replace("</head>", '  <meta name="description" content="Project description">\n</head>')
+                                    fixed = True
+                                elif "Missing viewport" in issue["description"]:
+                                    new_content = content.replace("</head>", '  <meta name="viewport" content="width=device-width, initial-scale=1">\n</head>')
+                                    fixed = True
+                                elif "Missing <h1>" in issue["description"]:
+                                    new_content = content.replace("<body>", "<body>\n  <h1>Main Heading</h1>")
+                                    fixed = True
+                                elif "Missing canonical" in issue["description"]:
+                                    new_content = content.replace("</head>", '  <link rel="canonical" href="https://example.com">\n</head>')
+                                    fixed = True
+                                elif "Missing Open Graph" in issue["description"]:
+                                    og = '  <meta property="og:title" content="Title">\n  <meta property="og:description" content="Description">\n'
+                                    new_content = content.replace("</head>", og + "</head>")
+                                    fixed = True
+                                elif "Missing lang" in issue["description"]:
+                                    new_content = content.replace("<html>", '<html lang="en">')
+                                    fixed = True
+                                elif "Image missing alt" in issue["description"]:
+                                    lines = content.split('\n')
+                                    if line_num <= len(lines):
+                                        lines[line_num - 1] = _re.sub(r'<img([^>]*)>', r'<img\1 alt="">', lines[line_num - 1], flags=_re.IGNORECASE)
+                                        new_content = '\n'.join(lines)
+                                        fixed = True
+                            elif issue["category"] == "Config" and "Missing .gitignore" in issue["description"]:
+                                with open(os.path.join(clone_dir, ".gitignore"), "w") as f:
+                                    f.write("node_modules/\n.env\n__pycache__/\n*.pyc\n.DS_Store\ndist/\nbuild/\n")
+                                fixed = True
+                            elif issue["category"] == "Documentation" and "Missing README.md" in issue["description"]:
+                                repo_n = st.session_state.gh_scanned_repo.rstrip("/").split("/")[-1].replace(".git", "")
+                                with open(os.path.join(clone_dir, "README.md"), "w") as f:
+                                    f.write(f"# {repo_n}\n\nProject description.\n")
+                                fixed = True
+                            elif issue["category"] == "Security" and "Secret file" in issue["description"]:
+                                gi_path = os.path.join(clone_dir, ".gitignore")
+                                if os.path.exists(gi_path):
+                                    with open(gi_path, "a") as f:
+                                        f.write(f"\n{issue['file']}\n")
+                                subprocess.run(["git", "-C", clone_dir, "rm", "--cached", issue["file"]],
+                                               capture_output=True)
+                                fixed = True
+
+                            if fixed and new_content != content:
+                                with open(target_file, "w") as f:
+                                    f.write(new_content)
+                        except Exception as e:
+                            fix_results.append({"issue": issue["description"], "error": str(e)})
+                            continue
+                    elif issue["category"] in ("Config", "Documentation"):
+                        try:
+                            if "Missing .gitignore" in issue["description"]:
+                                with open(os.path.join(clone_dir, ".gitignore"), "w") as f:
+                                    f.write("node_modules/\n.env\n__pycache__/\n.DS_Store\n")
+                                fixed = True
+                            elif "Missing README.md" in issue["description"]:
+                                repo_n = st.session_state.gh_scanned_repo.rstrip("/").split("/")[-1].replace(".git", "")
+                                with open(os.path.join(clone_dir, "README.md"), "w") as f:
+                                    f.write(f"# {repo_n}\n\nProject description.\n")
+                                fixed = True
+                        except Exception as e:
+                            fix_results.append({"issue": issue["description"], "error": str(e)})
+                            continue
+
+                    if not fixed:
+                        fix_results.append({"issue": issue["description"], "status": "skipped"})
+                        subprocess.run(["git", "-C", clone_dir, "checkout", "-"], capture_output=True)
+                        continue
+
+                    # Commit & push
+                    subprocess.run(["git", "-C", clone_dir, "add", "-A"], capture_output=True)
+                    subprocess.run(["git", "-C", clone_dir, "commit", "-m",
+                                   f"Auto-fix: {issue['description'][:60]} ({issue['category']})"],
+                                   capture_output=True)
+
+                    # Set auth and push
+                    auth_url = st.session_state.gh_scanned_repo.replace("https://", f"https://x-access-token:{github_token}@")
+                    subprocess.run(["git", "-C", clone_dir, "remote", "set-url", "origin", auth_url],
+                                   capture_output=True)
+                    push_res = subprocess.run(
+                        ["git", "-C", clone_dir, "push", "-u", "origin", branch_name],
+                        capture_output=True, text=True
+                    )
+
+                    pr_link = None
+                    if push_res.returncode == 0:
+                        try:
+                            import requests
+                            match = _re.search(r'github\.com/([^/]+)/([^/.]+)', st.session_state.gh_scanned_repo)
+                            if match:
+                                owner, repo = match.groups()
+                                pr_data = {
+                                    "title": f"🔧 Fix: {issue['description'][:80]}",
+                                    "body": f"**Category:** {issue['category']}\n**Severity:** {issue['severity']}\n**File:** {issue['file']}\n\n{issue.get('fix', '')}\n\n*Auto-fixed by SEO Command Center*",
+                                    "head": branch_name,
+                                    "base": "main"
+                                }
+                                headers = {"Authorization": f"token {github_token}", "Accept": "application/vnd.github.v3+json"}
+                                resp = requests.post(f"https://api.github.com/repos/{owner}/{repo}/pulls", json=pr_data, headers=headers)
+                                if resp.status_code == 201:
+                                    pr_link = resp.json().get("html_url")
+                                else:
+                                    # Try master
+                                    pr_data["base"] = "master"
+                                    resp = requests.post(f"https://api.github.com/repos/{owner}/{repo}/pulls", json=pr_data, headers=headers)
+                                    if resp.status_code == 201:
+                                        pr_link = resp.json().get("html_url")
+                        except Exception:
+                            pass
+
+                    fix_results.append({
+                        "issue": issue["description"],
+                        "category": issue["category"],
+                        "severity": issue["severity"],
+                        "file": issue["file"],
+                        "status": "fixed" if push_res.returncode == 0 else "push_failed",
+                        "branch": branch_name,
+                        "pr_url": pr_link
+                    })
+
+                    subprocess.run(["git", "-C", clone_dir, "checkout", "-"], capture_output=True)
+
+                progress_bar.empty()
+                status_text.empty()
+                st.session_state.gh_fix_results = fix_results
+
+                fixed_count = sum(1 for r in fix_results if r.get("status") == "fixed")
+                pr_count = sum(1 for r in fix_results if r.get("pr_url"))
+                st.success(f"✅ **Done!** Fixed {fixed_count}/{len(issues)} issues. Created {pr_count} Pull Requests.")
+                st.balloons()
+
+        # ── Show Fix Results ──
+        if st.session_state.gh_fix_results:
+            st.markdown("---")
+            st.markdown("### 🔧 Fix Results")
+
+            fix_results = st.session_state.gh_fix_results
+            fixed_count = sum(1 for r in fix_results if r.get("status") == "fixed")
+            skipped_count = sum(1 for r in fix_results if r.get("status") == "skipped")
+            failed_count = sum(1 for r in fix_results if r.get("status") not in ("fixed", "skipped"))
+            pr_count = sum(1 for r in fix_results if r.get("pr_url"))
+
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("✅ Fixed", fixed_count)
+            r2.metric("📋 PRs Created", pr_count)
+            r3.metric("⏭️ Skipped", skipped_count)
+            r4.metric("❌ Failed", failed_count)
+
+            # Show PRs
+            prs = [r for r in fix_results if r.get("pr_url")]
+            if prs:
+                st.markdown("#### 🔗 Pull Requests Created:")
+                for r in prs:
+                    st.markdown(f"- [{r['issue'][:60]}]({r['pr_url']})")
+
+            # Show all results in table
+            st.markdown("#### 📋 All Changes:")
+            for r in fix_results:
+                icon = "✅" if r.get("status") == "fixed" else "⏭️" if r.get("status") == "skipped" else "❌"
+                pr_link = f" → [View PR]({r['pr_url']})" if r.get("pr_url") else ""
+                st.markdown(f"{icon} **{r['issue']}** `{r.get('file', '')}` {pr_link}")
+
+    # ── Show Issue List (when scanned but not yet fixed) ──
+    if st.session_state.gh_scan_results and not st.session_state.gh_fix_results:
+        st.markdown("---")
+        st.markdown("### 📋 All Issues Found")
+
+        # Group by severity
+        issues = st.session_state.gh_scan_results["issues"]
+
+        for sev, icon, color in [("critical", "🔴", "red"), ("high", "🟠", "orange"), ("medium", "🟡", "yellow"), ("low", "🟢", "gray")]:
+            sev_issues = [i for i in issues if i["severity"] == sev]
+            if sev_issues:
+                with st.expander(f"{icon} {sev.upper()} ({len(sev_issues)} issues)", expanded=(sev in ("critical", "high"))):
+                    for issue in sev_issues:
+                        st.markdown(f"""
+                        <div style="background-color: var(--secondary-background-color); padding: 12px; border-radius: 8px; border-left: 4px solid {color}; margin-bottom: 8px;">
+                            <b>{issue['category']}</b>: {issue['description']}<br>
+                            <code>{issue['file']}:{issue['line']}</code> | 💡 {issue.get('fix', 'N/A')}
+                        </div>
+                        """, unsafe_allow_html=True)
 
 with tab_settings:
     st.subheader("⚙️ API Configuration")
