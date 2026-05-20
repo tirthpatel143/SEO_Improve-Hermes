@@ -608,9 +608,10 @@ with tab_github:
         scan_btn = st.button("🔍 Scan Repo", use_container_width=True, type="primary")
 
     github_token = os.environ.get("GITHUB_TOKEN", "").strip()
-
-    if not github_token:
-        st.warning("⚠️ **GitHub Token Required**: Add your `GITHUB_TOKEN` in the **Settings** tab to enable push/PR creation. You can still scan without it.")
+    # Detect placeholder tokens
+    if not github_token or github_token in ("***", "ghp_xxx", "ghp_your_token_here", ""):
+        github_token = ""
+        st.warning("⚠️ **GitHub Token Required**: Add a real `GITHUB_TOKEN` in the **Settings** tab. Get one at https://github.com/settings/tokens/new (select 'repo' scope). You can scan without it, but fixes cannot be pushed.")
 
     # ── Scan Action ──
     if scan_btn and gh_repo_url:
